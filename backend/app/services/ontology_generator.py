@@ -44,7 +44,7 @@ Please output JSON format with the following structure:
 {
     "entity_types": [
         {
-            "name": "Entity type name (English, PascalCase)",
+            "name": "REQUIRED top-level entity type name (English, PascalCase)",
             "description": "Brief description (English, no more than 100 characters)",
             "attributes": [
                 {
@@ -108,6 +108,7 @@ B. **Specific types (8, designed based on text content)**:
 ### 3. Attribute Design
 
 - 1-3 key attributes per entity type
+- Every entity type object must include a top-level `name` field. The reserved-word restriction below applies only to names inside `attributes`.
 - **Note**: Attribute names cannot use `name`, `uuid`, `group_id`, `created_at`, `summary` (these are system reserved words)
 - Recommended: `full_name`, `title`, `role`, `position`, `location`, `description`, etc.
 
@@ -200,8 +201,28 @@ class OntologyGenerator:
             max_tokens=4096
         )
 
-        # Validate and post-process
-        result = self._validate_and_process(result)
+        try:
+            result = self._validate_and_process(result)
+        except ValueError as validation_error:
+            repair_messages = messages + [
+                {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": (
+                        "Correct the ontology JSON you just returned. "
+                        f"Validation error: {validation_error} "
+                        "Every entity type must be an object with a non-empty top-level "
+                        "'name' field; the reserved-word rule applies only to attribute names. "
+                        "Return the complete corrected JSON object."
+                    ),
+                },
+            ]
+            result = self.llm_client.chat_json(
+                messages=repair_messages,
+                temperature=0.3,
+                max_tokens=4096
+            )
+            result = self._validate_and_process(result)
 
         return result
 
@@ -249,13 +270,16 @@ Based on the above content, design entity types and relationship types suitable 
 2. Last 2 must be fallback types: Person (individual fallback) and Organization (organization fallback)
 3. First 8 are specific types designed based on text content
 4. All entity types must be real-world subjects that can voice opinions, not abstract concepts
-5. Attribute names cannot use reserved words like name, uuid, group_id, use full_name, org_name, etc. instead
+5. Every entity type object must have a top-level "name" field. The reserved-word restriction applies only to attribute names; use full_name, org_name, etc. instead of "name" for attributes.
 """
 
         return message
     
     def _validate_and_process(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and post-process result"""
+
+        if not isinstance(result, dict):
+            raise ValueError("Ontology response must be a JSON object.")
 
         # Ensure necessary fields exist
         if "entity_types" not in result:
@@ -266,7 +290,17 @@ Based on the above content, design entity types and relationship types suitable 
             result["analysis_summary"] = ""
 
         # Validate entity types
-        for entity in result["entity_types"]:
+        if not isinstance(result["entity_types"], list):
+            raise ValueError("'entity_types' must be a list.")
+        for index, entity in enumerate(result["entity_types"]):
+            if not isinstance(entity, dict):
+                raise ValueError(f"'entity_types[{index}]' must be an object.")
+            name = entity.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"'entity_types[{index}]' is missing a non-empty top-level 'name' field."
+                )
+            entity["name"] = name.strip()
             if "attributes" not in entity:
                 entity["attributes"] = []
             if "examples" not in entity:
@@ -446,4 +480,3 @@ Based on the above content, design entity types and relationship types suitable 
         code_lines.append('}')
 
         return '\n'.join(code_lines)
-

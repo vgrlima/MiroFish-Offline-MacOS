@@ -1,6 +1,7 @@
 # OS
 .DS_Store
 Thumbs.db
+examples
 
 # 环境变量（保护敏感信息）
 .env
