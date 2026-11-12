@@ -5,7 +5,6 @@ Provides interfaces for simulation report generation, retrieval, and conversatio
 
 import os
 import traceback
-import threading
 from flask import request, jsonify, send_file, current_app
 
 from . import report_bp
@@ -13,7 +12,7 @@ from ..config import Config
 from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
-from ..models.task import TaskManager, TaskStatus
+from ..models.task import TaskManager
 from ..services.graph_tools import GraphToolsService
 from ..utils.logger import get_logger
 
@@ -62,42 +61,24 @@ def generate_report():
         import uuid
         report_id = f"report_{uuid.uuid4().hex[:12]}"
 
-        task_manager = TaskManager()
-        task_id = task_manager.create_task(
-            task_type="report_generate",
-            metadata={"simulation_id": simulation_id, "graph_id": graph_id, "report_id": report_id}
-        )
-
-        # Initialize graph_tools in Flask context BEFORE spawning thread
-        # (current_app is not available inside background threads)
         storage = current_app.extensions.get('neo4j_storage')
         if not storage:
             return jsonify({"success": False, "error": "GraphStorage not initialized — check Neo4j connection"}), 500
-        graph_tools = GraphToolsService(storage=storage)
 
-        def run_generate():
-            try:
-                task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=0, message="Initializing Report Agent...")
-                agent = ReportAgent(
-                    graph_id=graph_id,
-                    simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement,
-                    graph_tools=graph_tools
-                )
-                def progress_callback(stage, progress, message):
-                    task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
-                report = agent.generate_report(progress_callback=progress_callback, report_id=report_id)
-                ReportManager.save_report(report)
-                if report.status == ReportStatus.COMPLETED:
-                    task_manager.complete_task(task_id, result={"report_id": report.report_id, "simulation_id": simulation_id, "status": "completed"})
-                else:
-                    task_manager.fail_task(task_id, report.error or "Report generation failed")
-            except Exception as e:
-                logger.error(f"Report generation failed: {str(e)}")
-                task_manager.fail_task(task_id, str(e))
-
-        thread = threading.Thread(target=run_generate, daemon=True)
-        thread.start()
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(
+            task_type="report_generate",
+            metadata={
+                "simulation_id": simulation_id,
+                "graph_id": graph_id,
+                "report_id": report_id,
+                "resume_supported": True,
+            }
+        )
+        runner = current_app.extensions.get("background_task_runner")
+        if not runner:
+            raise RuntimeError("Background task runner is unavailable")
+        runner.start(task_id)
 
         return jsonify({"success": True, "data": {
             "simulation_id": simulation_id,

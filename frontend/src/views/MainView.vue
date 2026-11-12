@@ -347,6 +347,11 @@ const pollTaskStatus = async (taskId) => {
         stopPolling()
         error.value = task.error
         addLog(`Graph build task failed: ${task.error}`)
+      } else if (task.status === 'cancelled') {
+        stopPolling()
+        stopGraphPolling()
+        error.value = 'Graph build cancelled'
+        addLog('Graph build task cancelled.')
       }
     }
   } catch (e) {

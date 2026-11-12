@@ -643,6 +643,7 @@ import {
 
 const props = defineProps({
   simulationId: String,  // Passed from parent component
+  resumeTaskId: String,
   projectData: Object,
   graphData: Object,
   systemLogs: Array
@@ -768,7 +769,7 @@ const selectProfile = (profile) => {
 // Automatically start preparing simulation
 const startPrepareSimulation = async () => {
   if (!props.simulationId) {
-    addLog('Error：Missing simulationId')
+    addLog('Error: Missing simulation ID')
     emit('update-status', 'error')
     return
   }
@@ -819,6 +820,15 @@ const startPrepareSimulation = async () => {
     addLog(`Preparation exception: ${err.message}`)
     emit('update-status', 'error')
   }
+}
+
+const resumePreparation = async (existingTaskId) => {
+  taskId.value = existingTaskId
+  phase.value = 1
+  addLog(`Resuming preparation task ${existingTaskId}`)
+  startPolling()
+  startProfilesPolling()
+  await pollPrepareStatus()
 }
 
 const startPolling = () => {
@@ -898,6 +908,20 @@ const pollPrepareStatus = async () => {
         addLog(`✗ Preparation failed: ${data.error || 'Unknown error'}`)
         stopPolling()
         stopProfilesPolling()
+      } else if (data.status === 'cancelled') {
+        addLog('Preparation cancelled')
+        progressMessage.value = 'Preparation cancelled'
+        phase.value = 0
+        stopPolling()
+        stopProfilesPolling()
+        stopConfigPolling()
+      } else if (data.status === 'interrupted') {
+        addLog('Preparation was interrupted when the backend stopped')
+        progressMessage.value = 'Preparation interrupted'
+        phase.value = 0
+        stopPolling()
+        stopProfilesPolling()
+        stopConfigPolling()
       }
     }
   } catch (err) {
@@ -1066,8 +1090,9 @@ watch(() => props.systemLogs?.length, () => {
 })
 
 onMounted(() => {
-  // Automatically start preparation process
-  if (props.simulationId) {
+  if (props.resumeTaskId) {
+    resumePreparation(props.resumeTaskId)
+  } else if (props.simulationId) {
     addLog('Step2 Env Setup Initialization')
     startPrepareSimulation()
   }

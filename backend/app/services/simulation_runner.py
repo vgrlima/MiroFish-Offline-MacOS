@@ -12,6 +12,7 @@ import threading
 import subprocess
 import signal
 import atexit
+import tempfile
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +43,7 @@ class RunnerStatus(str, Enum):
     STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass
@@ -142,6 +144,10 @@ class SimulationRunState:
 
     # Process ID (for stopping)
     process_pid: Optional[int] = None
+    graph_memory_update_enabled: bool = False
+    graph_id: Optional[str] = None
+    platform: str = "parallel"
+    max_rounds: Optional[int] = None
     
     def add_action(self, action: AgentAction):
         """Add action to recent actions list"""
@@ -182,6 +188,10 @@ class SimulationRunState:
             "completed_at": self.completed_at,
             "error": self.error,
             "process_pid": self.process_pid,
+            "graph_memory_update_enabled": self.graph_memory_update_enabled,
+            "graph_id": self.graph_id,
+            "platform": self.platform,
+            "max_rounds": self.max_rounds,
         }
 
     def to_detail_dict(self) -> Dict[str, Any]:
@@ -190,6 +200,60 @@ class SimulationRunState:
         result["recent_actions"] = [a.to_dict() for a in self.recent_actions]
         result["rounds_count"] = len(self.rounds)
         return result
+
+
+class _RecoveredProcess:
+    """Process handle that can monitor and stop a simulation after a backend restart."""
+
+    def __init__(
+        self,
+        process_id: int,
+        simulation_id: str,
+        state: SimulationRunState,
+        use_process_group: bool = True,
+    ):
+        self.pid = process_id
+        self.simulation_id = simulation_id
+        self.state = state
+        self.use_process_group = use_process_group
+        self._returncode = None
+
+    @property
+    def returncode(self):
+        self.poll()
+        return self._returncode
+
+    def poll(self):
+        if self._returncode is not None:
+            return self._returncode
+        if SimulationRunner._process_matches_simulation(self.pid, self.simulation_id):
+            return None
+        completed = (
+            (not self.state.twitter_running or self.state.twitter_completed)
+            and (not self.state.reddit_running or self.state.reddit_completed)
+        )
+        self._returncode = 0 if completed else 1
+        return self._returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.pid, timeout)
+            time.sleep(0.1)
+        return self._returncode
+
+    def terminate(self):
+        if IS_WINDOWS or not self.use_process_group:
+            os.kill(self.pid, signal.SIGTERM)
+        else:
+            os.killpg(self.pid, signal.SIGTERM)
+
+    def kill(self):
+        if IS_WINDOWS or not self.use_process_group:
+            os.kill(self.pid, signal.SIGKILL)
+        else:
+            os.killpg(self.pid, signal.SIGKILL)
 
 
 class SimulationRunner:
@@ -272,6 +336,10 @@ class SimulationRunner:
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
+                graph_memory_update_enabled=data.get("graph_memory_update_enabled", False),
+                graph_id=data.get("graph_id"),
+                platform=data.get("platform", "parallel"),
+                max_rounds=data.get("max_rounds"),
             )
 
             # Load recent actions
@@ -302,9 +370,19 @@ class SimulationRunner:
         state_file = os.path.join(sim_dir, "run_state.json")
         
         data = state.to_detail_dict()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        file_descriptor, temporary_path = tempfile.mkstemp(dir=sim_dir, prefix=".run-state-")
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as state_file_handle:
+                json.dump(data, state_file_handle, ensure_ascii=False, indent=2)
+                state_file_handle.flush()
+                os.fsync(state_file_handle.fileno())
+            os.replace(temporary_path, state_file)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
         
         cls._run_states[state.simulation_id] = state
     
@@ -365,6 +443,10 @@ class SimulationRunner:
             total_rounds=total_rounds,
             total_simulation_hours=total_hours,
             started_at=datetime.now().isoformat(),
+            graph_memory_update_enabled=enable_graph_memory_update,
+            graph_id=graph_id,
+            platform=platform,
+            max_rounds=max_rounds,
         )
         
         cls._save_run_state(state)
@@ -714,6 +796,62 @@ class SimulationRunner:
         
         # At least one platform is enabled and completed
         return twitter_enabled or reddit_enabled
+
+    @classmethod
+    def _process_matches_simulation(cls, process_id: int, simulation_id: str) -> bool:
+        if not cls._pid_is_alive(process_id):
+            return False
+
+        if IS_WINDOWS:
+            return False
+        try:
+            proc_cmdline = f"/proc/{process_id}/cmdline"
+            if os.path.exists(proc_cmdline):
+                with open(proc_cmdline, "rb") as command_file:
+                    command = command_file.read().replace(b"\0", b" ").decode(errors="replace")
+            else:
+                result = subprocess.run(
+                    ["ps", "-ww", "-p", str(process_id), "-o", "command="],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+                command = result.stdout
+        except (OSError, subprocess.SubprocessError):
+            logger.exception("Could not verify recovered simulation process %s", process_id)
+            return False
+
+        expected_scripts = (
+            "run_parallel_simulation.py",
+            "run_twitter_simulation.py",
+            "run_reddit_simulation.py",
+        )
+        return simulation_id in command and any(script in command for script in expected_scripts)
+
+    @staticmethod
+    def _pid_is_alive(process_id: int) -> bool:
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @classmethod
+    def _process_group_is_alive(cls, process_id: int) -> bool:
+        if IS_WINDOWS:
+            return cls._pid_is_alive(process_id)
+        try:
+            os.killpg(process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
     
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):
@@ -755,21 +893,25 @@ class SimulationRunner:
                 except subprocess.TimeoutExpired:
                     process.kill()
         else:
-            # Unix: Use process group termination
-            # Since start_new_session=True, process group ID equals main process PID
-            pgid = os.getpgid(process.pid)
-            logger.info(f"Terminate process group (Unix): simulation={simulation_id}, pgid={pgid}")
-            
-            # First send SIGTERM to the entire process group
-            os.killpg(pgid, signal.SIGTERM)
-            
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # If still not ended after timeout, force send SIGKILL
-                logger.warning(f"Process group not responding to SIGTERM, force terminating: {simulation_id}")
-                os.killpg(pgid, signal.SIGKILL)
-                process.wait(timeout=5)
+            if getattr(process, "use_process_group", True):
+                # Processes started with start_new_session=True have their own process group.
+                pgid = os.getpgid(process.pid)
+                logger.info(f"Terminate process group (Unix): simulation={simulation_id}, pgid={pgid}")
+                os.killpg(pgid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Process group not responding, force terminating: {simulation_id}")
+                    os.killpg(pgid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            else:
+                # A recovered process outside its own group may be killed by PID only.
+                process.terminate()
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
     
     @classmethod
     def stop_simulation(cls, simulation_id: str) -> SimulationRunState:
@@ -1184,9 +1326,9 @@ class SimulationRunner:
     @classmethod
     def cleanup_all_simulations(cls):
         """
-        Clean up all running simulation processes
+        Detach from simulations that may be reattached by a restarted backend.
         
-        Called when server closes, ensures all child processes are terminated
+        A container or operating-system shutdown may still terminate child processes.
         """
         # Prevent duplicate cleanup
         if cls._cleanup_done:
@@ -1200,7 +1342,7 @@ class SimulationRunner:
         if not has_processes and not has_updaters:
             return  # No content to clean, return silently
         
-        logger.info("Cleaning up all simulation processes...")
+        logger.info("Preparing simulation processes for backend restart...")
         
         # First stop all graph memory updaters (stop_all prints logs internally)
         try:
@@ -1209,55 +1351,16 @@ class SimulationRunner:
             logger.error(f"Failed to stop graph memory updater: {e}")
         cls._graph_memory_enabled.clear()
         
-        # Copy dict to avoid modification during iteration
-        processes = list(cls._processes.items())
-        
-        for simulation_id, process in processes:
+        for simulation_id, process in list(cls._processes.items()):
             try:
-                if process.poll() is None:  # Process still running
-                    logger.info(f"Terminate simulation process: {simulation_id}, pid={process.pid}")
-                    
-                    try:
-                        # Use cross-platform process termination method
-                        cls._terminate_process(process, simulation_id, timeout=5)
-                    except (ProcessLookupError, OSError):
-                        # Process may no longer exist, try direct termination
-                        try:
-                            process.terminate()
-                            process.wait(timeout=3)
-                        except Exception:
-                            process.kill()
-                    
-                    # Update run_state.json
-                    state = cls.get_run_state(simulation_id)
-                    if state:
-                        state.runner_status = RunnerStatus.STOPPED
-                        state.twitter_running = False
-                        state.reddit_running = False
-                        state.completed_at = datetime.now().isoformat()
-                        state.error = "Server closed, simulation terminated"
-                        cls._save_run_state(state)
-                    
-                    # Also update state.json, set status to stopped
-                    try:
-                        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-                        state_file = os.path.join(sim_dir, "state.json")
-                        logger.info(f"Attempting to update state.json: {state_file}")
-                        if os.path.exists(state_file):
-                            with open(state_file, 'r', encoding='utf-8') as f:
-                                state_data = json.load(f)
-                            state_data['status'] = 'stopped'
-                            state_data['updated_at'] = datetime.now().isoformat()
-                            with open(state_file, 'w', encoding='utf-8') as f:
-                                json.dump(state_data, f, indent=2, ensure_ascii=False)
-                            logger.info(f"Updated state.json status to stopped: {simulation_id}")
-                        else:
-                            logger.warning(f"state.json does not exist: {state_file}")
-                    except Exception as state_err:
-                        logger.warning(f"Failed to update state.json: {simulation_id}, error={state_err}")
-                        
-            except Exception as e:
-                logger.error(f"Failed to clean up process: {simulation_id}, error={e}")
+                if process.poll() is None:
+                    logger.info(
+                        "Leaving simulation process running for recovery: simulation=%s, pid=%s",
+                        simulation_id,
+                        process.pid,
+                    )
+            except Exception:
+                logger.exception("Could not inspect simulation process during shutdown: %s", simulation_id)
         
         # Clean up file handles
         for simulation_id, file_handle in list(cls._stdout_files.items()):
@@ -1280,14 +1383,14 @@ class SimulationRunner:
         cls._processes.clear()
         cls._action_queues.clear()
         
-        logger.info("Simulation process cleanup completed")
+        logger.info("Simulation process handles detached")
     
     @classmethod
     def register_cleanup(cls):
         """
-        Register cleanup function
+        Register backend shutdown handler
         
-        Called when Flask app starts, ensures all simulation processes are cleaned when server closes
+        Called when Flask app starts to preserve process state for reattachment.
         """
         global _cleanup_registered
         
@@ -1315,7 +1418,7 @@ class SimulationRunner:
             original_sighup = signal.getsignal(signal.SIGHUP)
         
         def cleanup_handler(signum=None, frame=None):
-            """Signal handler: clean up simulation processes first, then call original handler"""
+            """Release backend resources before calling the original signal handler."""
             # Only print logs if there are processes to clean
             if cls._processes or cls._graph_memory_enabled:
                 logger.info(f"Received signal {signum}, starting cleanup...")
@@ -1356,14 +1459,97 @@ class SimulationRunner:
         _cleanup_registered = True
     
     @classmethod
-    def get_running_simulations(cls) -> List[str]:
+    def get_running_simulations(
+        cls,
+        storage: 'GraphStorage' = None,
+        startup_recovery: bool = False,
+    ) -> List[str]:
         """
-        Get list of all running simulation IDs
+        Get current simulations and recover process handles after a backend restart.
         """
         running = []
+        known_ids = set(cls._processes)
         for sim_id, process in cls._processes.items():
             if process.poll() is None:
                 running.append(sim_id)
+
+        recoverable_statuses = {
+            RunnerStatus.STARTING,
+            RunnerStatus.RUNNING,
+            RunnerStatus.PAUSED,
+            RunnerStatus.STOPPING,
+        }
+        if not os.path.isdir(cls.RUN_STATE_DIR):
+            return running
+
+        for simulation_id in os.listdir(cls.RUN_STATE_DIR):
+            if simulation_id in known_ids:
+                continue
+            state = cls.get_run_state(simulation_id)
+            if not state or state.runner_status not in recoverable_statuses:
+                continue
+
+            if not state.process_pid:
+                if startup_recovery:
+                    state.runner_status = RunnerStatus.INTERRUPTED
+                    state.twitter_running = False
+                    state.reddit_running = False
+                    state.completed_at = datetime.now().isoformat()
+                    state.error = "Backend restarted before the simulation process ID was saved"
+                    cls._save_run_state(state)
+                continue
+
+            if cls._process_matches_simulation(state.process_pid, simulation_id):
+                try:
+                    use_process_group = (
+                        not IS_WINDOWS
+                        and os.getpgid(state.process_pid) == state.process_pid
+                    )
+                except ProcessLookupError:
+                    continue
+
+                process = _RecoveredProcess(
+                    state.process_pid,
+                    simulation_id,
+                    state,
+                    use_process_group=use_process_group,
+                )
+                cls._processes[simulation_id] = process
+                monitor_thread = threading.Thread(
+                    target=cls._monitor_simulation,
+                    args=(simulation_id,),
+                    daemon=True,
+                    name=f"simulation-monitor-{simulation_id[:8]}",
+                )
+                cls._monitor_threads[simulation_id] = monitor_thread
+                monitor_thread.start()
+                running.append(simulation_id)
+
+                if state.graph_memory_update_enabled and state.graph_id and storage:
+                    try:
+                        GraphMemoryManager.create_updater(
+                            simulation_id,
+                            state.graph_id,
+                            storage,
+                        )
+                        cls._graph_memory_enabled[simulation_id] = True
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore graph memory updater for simulation %s",
+                            simulation_id,
+                        )
+            else:
+                state.runner_status = RunnerStatus.INTERRUPTED
+                state.twitter_running = False
+                state.reddit_running = False
+                state.completed_at = datetime.now().isoformat()
+                state.error = (
+                    "The simulation process stopped while the backend was unavailable. "
+                    "OASIS keeps its agent environment in memory, so this run cannot resume "
+                    "exactly; restart it to begin a new run."
+                )
+                cls._save_run_state(state)
+
         return running
     
     # ============== Interview functionality ==============

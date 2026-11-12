@@ -15,7 +15,12 @@ class GraphStorage(ABC):
     # --- Graph lifecycle ---
 
     @abstractmethod
-    def create_graph(self, name: str, description: str = "") -> str:
+    def create_graph(
+        self,
+        name: str,
+        description: str = "",
+        graph_id: Optional[str] = None,
+    ) -> str:
         """Create a new graph. Returns graph_id."""
 
     @abstractmethod
@@ -33,7 +38,12 @@ class GraphStorage(ABC):
     # --- Add data ---
 
     @abstractmethod
-    def add_text(self, graph_id: str, text: str) -> str:
+    def add_text(
+        self,
+        graph_id: str,
+        text: str,
+        episode_id: Optional[str] = None,
+    ) -> str:
         """
         Process text: NER/RE → create nodes/edges → return episode_id.
         This is synchronous (unlike Zep Cloud's async episodes).

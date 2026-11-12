@@ -5,7 +5,6 @@ Uses project context mechanism with server-side state persistence
 
 import os
 import traceback
-import threading
 from flask import request, jsonify, current_app
 
 from . import graph_bp
@@ -357,12 +356,24 @@ def build_graph():
                 "error": "Ontology definition not found"
             }), 400
 
-        # Get storage in request context (background thread cannot access current_app)
-        storage = _get_storage()
+        if current_app.extensions.get("neo4j_storage") is None:
+            return jsonify({
+                "success": False,
+                "error": "GraphStorage not initialized — check Neo4j connection"
+            }), 503
 
-        # Create async task
         task_manager = TaskManager()
-        task_id = task_manager.create_task(f"Build graph: {graph_name}")
+        task_id = task_manager.create_task(
+            task_type="graph_build",
+            metadata={
+                "project_id": project_id,
+                "graph_name": graph_name,
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "resume_supported": True,
+                "checkpoint_version": 1,
+            },
+        )
         logger.info(f"Graph build task created: task_id={task_id}, project_id={project_id}")
         
         # Update project status
@@ -370,132 +381,10 @@ def build_graph():
         project.graph_build_task_id = task_id
         ProjectManager.save_project(project)
 
-        # Start background task
-        def build_task():
-            build_logger = get_logger('mirofish.build')
-            try:
-                build_logger.info(f"[{task_id}] Starting graph build...")
-                task_manager.update_task(
-                    task_id,
-                    status=TaskStatus.PROCESSING,
-                    message="Initializing graph build service..."
-                )
-
-                # Create graph builder service (storage passed from outer closure)
-                builder = GraphBuilderService(storage=storage)
-
-                # Chunk text
-                task_manager.update_task(
-                    task_id,
-                    message="Chunking text...",
-                    progress=5
-                )
-                chunks = TextProcessor.split_text(
-                    text,
-                    chunk_size=chunk_size,
-                    overlap=chunk_overlap
-                )
-                total_chunks = len(chunks)
-
-                # Create graph
-                task_manager.update_task(
-                    task_id,
-                    message="Creating Zep graph...",
-                    progress=10
-                )
-                graph_id = builder.create_graph(name=graph_name)
-
-                # Update project graph_id
-                project.graph_id = graph_id
-                ProjectManager.save_project(project)
-
-                # Set ontology
-                task_manager.update_task(
-                    task_id,
-                    message="Setting ontology definition...",
-                    progress=15
-                )
-                builder.set_ontology(graph_id, ontology)
-                
-                # Add text (progress_callback signature is (msg, progress_ratio))
-                def add_progress_callback(msg, progress_ratio):
-                    progress = 15 + int(progress_ratio * 40)  # 15% - 55%
-                    task_manager.update_task(
-                        task_id,
-                        message=msg,
-                        progress=progress
-                    )
-
-                task_manager.update_task(
-                    task_id,
-                    message=f"Starting to add {total_chunks} text chunks...",
-                    progress=15
-                )
-
-                episode_uuids = builder.add_text_batches(
-                    graph_id,
-                    chunks,
-                    batch_size=3,
-                    progress_callback=add_progress_callback
-                )
-
-                # Neo4j processing is synchronous, no need to wait
-                task_manager.update_task(
-                    task_id,
-                    message="Text processing completed, generating graph data...",
-                    progress=90
-                )
-
-                # Get graph data
-                task_manager.update_task(
-                    task_id,
-                    message="Retrieving graph data...",
-                    progress=95
-                )
-                graph_data = builder.get_graph_data(graph_id)
-
-                # Update project status
-                project.status = ProjectStatus.GRAPH_COMPLETED
-                ProjectManager.save_project(project)
-
-                node_count = graph_data.get("node_count", 0)
-                edge_count = graph_data.get("edge_count", 0)
-                build_logger.info(f"[{task_id}] Graph build completed: graph_id={graph_id}, nodes={node_count}, edges={edge_count}")
-
-                # Complete
-                task_manager.update_task(
-                    task_id,
-                    status=TaskStatus.COMPLETED,
-                    message="Graph build completed",
-                    progress=100,
-                    result={
-                        "project_id": project_id,
-                        "graph_id": graph_id,
-                        "node_count": node_count,
-                        "edge_count": edge_count,
-                        "chunk_count": total_chunks
-                    }
-                )
-
-            except Exception as e:
-                # Update project status to failed
-                build_logger.error(f"[{task_id}] Graph build failed: {str(e)}")
-                build_logger.debug(traceback.format_exc())
-
-                project.status = ProjectStatus.FAILED
-                project.error = str(e)
-                ProjectManager.save_project(project)
-
-                task_manager.update_task(
-                    task_id,
-                    status=TaskStatus.FAILED,
-                    message=f"Build failed: {str(e)}",
-                    error=traceback.format_exc()
-                )
-
-        # Start background thread
-        thread = threading.Thread(target=build_task, daemon=True)
-        thread.start()
+        runner = current_app.extensions.get("background_task_runner")
+        if not runner:
+            raise RuntimeError("Background task runner is unavailable")
+        runner.start(task_id)
 
         return jsonify({
             "success": True,
@@ -521,7 +410,7 @@ def get_task(task_id: str):
     """
     Query task status
     """
-    task = TaskManager().get_task(task_id)
+    task = TaskManager().get_task_data(task_id)
 
     if not task:
         return jsonify({
@@ -529,9 +418,13 @@ def get_task(task_id: str):
             "error": f"Task does not exist: {task_id}"
         }), 404
 
+    runner = current_app.extensions.get("background_task_runner")
+    task["resumable"] = bool(
+        runner and runner.can_resume(task["task_type"], task.get("metadata") or {})
+    )
     return jsonify({
         "success": True,
-        "data": task.to_dict()
+        "data": task
     })
 
 
@@ -541,12 +434,57 @@ def list_tasks():
     List all tasks
     """
     tasks = TaskManager().list_tasks()
+    runner = current_app.extensions.get("background_task_runner")
+    for task in tasks:
+        task["resumable"] = bool(
+            runner and runner.can_resume(task["task_type"], task.get("metadata") or {})
+        )
     
     return jsonify({
         "success": True,
-        "data": [t.to_dict() for t in tasks],
+        "data": tasks,
         "count": len(tasks)
     })
+
+
+@graph_bp.route('/task/<task_id>/cancel', methods=['POST'])
+def cancel_task(task_id: str):
+    """Request cancellation of an active background task."""
+    task_manager = TaskManager()
+    task = task_manager.get_task(task_id)
+    if not task:
+        return jsonify({"success": False, "error": f"Task does not exist: {task_id}"}), 404
+
+    result = task_manager.cancel_task(task_id)
+    if result["status"] not in [TaskStatus.CANCELLING.value]:
+        return jsonify({"success": False, "error": "Task is no longer active"}), 409
+
+    return jsonify({"success": True, "data": result})
+
+
+@graph_bp.route('/task/<task_id>/resume', methods=['POST'])
+def resume_task(task_id: str):
+    """Resume a failed or interrupted task from its last durable checkpoint."""
+    task = TaskManager().get_task_data(task_id)
+    if not task:
+        return jsonify({"success": False, "error": f"Task does not exist: {task_id}"}), 404
+
+    runner = current_app.extensions.get("background_task_runner")
+    if not runner:
+        return jsonify({"success": False, "error": "Background task runner is unavailable"}), 503
+
+    try:
+        resumed = runner.resume(task_id)
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 409
+    return jsonify({"success": True, "data": resumed})
+
+
+@graph_bp.route('/tasks/history', methods=['DELETE'])
+def clear_task_history():
+    """Remove completed, failed, and cancelled tasks without touching active work."""
+    deleted_count = TaskManager().clear_history()
+    return jsonify({"success": True, "data": {"deleted_count": deleted_count}})
 
 
 # ============== Graph Data Interface ==============

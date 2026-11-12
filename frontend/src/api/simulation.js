@@ -93,6 +93,20 @@ export const stopSimulation = (data) => {
 }
 
 /**
+ * List currently running simulation processes
+ */
+export const listRunningSimulations = () => {
+  return service.get('/api/simulation/running')
+}
+
+/**
+ * List saved terminal simulation runs
+ */
+export const listSimulationRunHistory = () => {
+  return service.get('/api/simulation/run-history')
+}
+
+/**
  * Get simulation real-time run status
  * @param {string} simulationId
  */

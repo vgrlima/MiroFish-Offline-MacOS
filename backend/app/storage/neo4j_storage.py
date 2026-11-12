@@ -100,29 +100,36 @@ class Neo4jStorage(GraphStorage):
     # Graph lifecycle
     # ----------------------------------------------------------------
 
-    def create_graph(self, name: str, description: str = "") -> str:
-        graph_id = str(uuid.uuid4())
+    def create_graph(
+        self,
+        name: str,
+        description: str = "",
+        graph_id: Optional[str] = None,
+    ) -> str:
+        graph_id = graph_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         def _create(tx):
-            tx.run(
+            result = tx.run(
                 """
-                CREATE (g:Graph {
-                    graph_id: $graph_id,
-                    name: $name,
-                    description: $description,
-                    ontology_json: '{}',
-                    created_at: $created_at
-                })
+                MERGE (g:Graph {graph_id: $graph_id})
+                ON CREATE SET
+                    g.name = $name,
+                    g.description = $description,
+                    g.ontology_json = '{}',
+                    g.created_at = $created_at
+                RETURN g.graph_id AS graph_id
                 """,
                 graph_id=graph_id,
                 name=name,
                 description=description,
                 created_at=now,
             )
+            record = result.single()
+            return record["graph_id"] if record else graph_id
 
         with self._driver.session() as session:
-            self._call_with_retry(session.execute_write, _create)
+            graph_id = self._call_with_retry(session.execute_write, _create)
 
         logger.info(f"Created graph '{name}' with id {graph_id}")
         return graph_id
@@ -173,10 +180,27 @@ class Neo4jStorage(GraphStorage):
     # Add data (NER → nodes/edges)
     # ----------------------------------------------------------------
 
-    def add_text(self, graph_id: str, text: str) -> str:
+    def add_text(
+        self,
+        graph_id: str,
+        text: str,
+        episode_id: Optional[str] = None,
+    ) -> str:
         """Process text: NER/RE → batch embed → create nodes/edges → return episode_id."""
-        episode_id = str(uuid.uuid4())
+        episode_id = episode_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+
+        with self._driver.session() as session:
+            existing_episode = session.run(
+                """
+                MATCH (ep:Episode {graph_id: $graph_id, uuid: $episode_id})
+                RETURN ep.processed AS processed
+                """,
+                graph_id=graph_id,
+                episode_id=episode_id,
+            ).single()
+            if existing_episode and existing_episode["processed"]:
+                return episode_id
 
         # Get ontology for NER guidance
         ontology = self.get_ontology(graph_id)
@@ -214,13 +238,11 @@ class Neo4jStorage(GraphStorage):
             def _create_episode(tx):
                 tx.run(
                     """
-                    CREATE (ep:Episode {
-                        uuid: $uuid,
-                        graph_id: $graph_id,
-                        data: $data,
-                        processed: true,
-                        created_at: $created_at
-                    })
+                    MERGE (ep:Episode {graph_id: $graph_id, uuid: $uuid})
+                    ON CREATE SET
+                        ep.data = $data,
+                        ep.processed = false,
+                        ep.created_at = $created_at
                     """,
                     uuid=episode_id,
                     graph_id=graph_id,
@@ -309,12 +331,18 @@ class Neo4jStorage(GraphStorage):
                     continue
 
                 fact_embedding = relation_embeddings[idx] if idx < len(relation_embeddings) else []
-                r_uuid = str(uuid.uuid4())
+                r_uuid = str(uuid.uuid5(uuid.UUID(episode_id), f"relation:{idx}"))
 
                 def _create_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
                                      _target_uuid=target_uuid, _rtype=rtype,
                                      _fact=fact, _fact_emb=fact_embedding,
                                      _episode_id=episode_id, _now=now):
+                    existing = tx.run(
+                        "MATCH ()-[r:RELATION {uuid: $uuid}]-() RETURN r.uuid AS uuid",
+                        uuid=_r_uuid,
+                    ).single()
+                    if existing:
+                        return
                     tx.run(
                         """
                         MATCH (src:Entity {uuid: $src_uuid})
@@ -345,6 +373,18 @@ class Neo4jStorage(GraphStorage):
                     )
 
                 self._call_with_retry(session.execute_write, _create_relation)
+
+            self._call_with_retry(
+                session.execute_write,
+                lambda tx: tx.run(
+                    """
+                    MATCH (ep:Episode {graph_id: $graph_id, uuid: $episode_id})
+                    SET ep.processed = true
+                    """,
+                    graph_id=graph_id,
+                    episode_id=episode_id,
+                ),
+            )
 
         logger.info(f"[add_text] Chunk done: episode={episode_id}")
         return episode_id

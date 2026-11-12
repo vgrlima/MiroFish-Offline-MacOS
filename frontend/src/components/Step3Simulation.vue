@@ -298,6 +298,7 @@ import { generateReport } from '../api/report'
 
 const props = defineProps({
   simulationId: String,
+  resumeRun: Boolean,
   maxRounds: Number, // Max rounds passed from Step2
   minutesPerRound: {
     type: Number,
@@ -434,6 +435,41 @@ const doStartSimulation = async () => {
   }
 }
 
+const resumeSimulationRun = async () => {
+  if (!props.simulationId) return
+
+  addLog('Resuming the existing simulation process...')
+  try {
+    const res = await getRunStatus(props.simulationId)
+    if (!res.success || !res.data) {
+      throw new Error(res.error || 'Could not load simulation status')
+    }
+
+    runStatus.value = res.data
+    prevTwitterRound.value = res.data.twitter_current_round || 0
+    prevRedditRound.value = res.data.reddit_current_round || 0
+    await fetchRunStatusDetail()
+
+    if (['running', 'starting', 'paused', 'stopping'].includes(res.data.runner_status)) {
+      phase.value = 1
+      emit('update-status', 'processing')
+      startStatusPolling()
+      startDetailPolling()
+    } else if (['completed', 'stopped'].includes(res.data.runner_status)) {
+      phase.value = 2
+      emit('update-status', 'completed')
+    } else {
+      phase.value = 2
+      startError.value = res.data.error || 'The simulation process is no longer active'
+      emit('update-status', 'error')
+    }
+  } catch (error) {
+    startError.value = error.message
+    addLog(`Could not resume simulation: ${error.message}`)
+    emit('update-status', 'error')
+  }
+}
+
 // Stop simulation
 const handleStopSimulation = async () => {
   if (!props.simulationId) return
@@ -506,6 +542,15 @@ const fetchRunStatus = async () => {
       if (data.reddit_current_round > prevRedditRound.value) {
         addLog(`[Topic Community] R${data.reddit_current_round}/${data.total_rounds} | T:${data.reddit_simulated_hours || 0}h | A:${data.reddit_actions_count}`)
         prevRedditRound.value = data.reddit_current_round
+      }
+
+      if (data.runner_status === 'failed') {
+        startError.value = data.error || 'The simulation process failed'
+        addLog(`✗ Simulation failed: ${startError.value}`)
+        phase.value = 2
+        stopPolling()
+        emit('update-status', 'error')
+        return
       }
 
       // Check if simulation is complete (via runner_status or platform completion status)
@@ -687,7 +732,11 @@ watch(() => props.systemLogs?.length, () => {
 onMounted(() => {
   addLog('Step3 Simulation initialization')
   if (props.simulationId) {
-    doStartSimulation()
+    if (props.resumeRun) {
+      resumeSimulationRun()
+    } else {
+      doStartSimulation()
+    }
   }
 })
 

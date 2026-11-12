@@ -50,6 +50,7 @@
       <div class="panel-wrapper right" :style="rightPanelStyle">
         <Step2EnvSetup
           :simulationId="currentSimulationId"
+          :resume-task-id="route.query.taskId"
           :projectData="projectData"
           :graphData="graphData"
           :systemLogs="systemLogs"

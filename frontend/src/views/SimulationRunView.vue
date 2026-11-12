@@ -51,6 +51,7 @@
       <div class="panel-wrapper right" :style="rightPanelStyle">
         <Step3Simulation
           :simulationId="currentSimulationId"
+          :resumeRun="route.query.resume === 'true'"
           :maxRounds="maxRounds"
           :minutesPerRound="minutesPerRound"
           :projectData="projectData"

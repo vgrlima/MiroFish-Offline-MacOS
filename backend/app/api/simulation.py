@@ -387,10 +387,7 @@ def prepare_simulation():
             }
         }
     """
-    import threading
-    import os
-    from ..models.task import TaskManager, TaskStatus
-    from ..config import Config
+    from ..models.task import TaskManager
     
     try:
         data = request.get_json() or {}
@@ -452,8 +449,6 @@ def prepare_simulation():
             }), 400
         
         # Get document text
-        document_text = ProjectManager.get_extracted_text(state.project_id) or ""
-        
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
         parallel_profile_count = data.get('parallel_profile_count', 5)
@@ -488,7 +483,11 @@ def prepare_simulation():
             task_type="simulation_prepare",
             metadata={
                 "simulation_id": simulation_id,
-                "project_id": state.project_id
+                "project_id": state.project_id,
+                "entity_types": entity_types_list,
+                "use_llm_for_profiles": use_llm_for_profiles,
+                "parallel_profile_count": parallel_profile_count,
+                "resume_supported": True,
             }
         )
         
@@ -496,112 +495,10 @@ def prepare_simulation():
         state.status = SimulationStatus.PREPARING
         manager._save_simulation_state(state)
         
-        # Define background task
-        def run_prepare():
-            try:
-                task_manager.update_task(
-                    task_id,
-                    status=TaskStatus.PROCESSING,
-                    progress=0,
-                    message="Start preparing simulation environment..."
-                )
-                
-                # PrepareSimulation（With progress callback）
-                # Store stage progress details
-                stage_details = {}
-                
-                def progress_callback(stage, progress, message, **kwargs):
-                    # Calculate total progress
-                    stage_weights = {
-                        "reading": (0, 20),           # 0-20%
-                        "generating_profiles": (20, 70),  # 20-70%
-                        "generating_config": (70, 90),    # 70-90%
-                        "copying_scripts": (90, 100)       # 90-100%
-                    }
-                    
-                    start, end = stage_weights.get(stage, (0, 100))
-                    current_progress = int(start + (end - start) * progress / 100)
-                    
-                    # Build detailed progress information
-                    stage_names = {
-                        "reading": "Read knowledge graph entities",
-                        "generating_profiles": "GenerateAgentpersona",
-                        "generating_config": "Generate simulation configuration",
-                        "copying_scripts": "Prepare simulation scripts"
-                    }
-                    
-                    stage_index = list(stage_weights.keys()).index(stage) + 1 if stage in stage_weights else 1
-                    total_stages = len(stage_weights)
-                    
-                    # Update stage details
-                    stage_details[stage] = {
-                        "stage_name": stage_names.get(stage, stage),
-                        "stage_progress": progress,
-                        "current": kwargs.get("current", 0),
-                        "total": kwargs.get("total", 0),
-                        "item_name": kwargs.get("item_name", "")
-                    }
-                    
-                    # Build detailed progress information
-                    detail = stage_details[stage]
-                    progress_detail_data = {
-                        "current_stage": stage,
-                        "current_stage_name": stage_names.get(stage, stage),
-                        "stage_index": stage_index,
-                        "total_stages": total_stages,
-                        "stage_progress": progress,
-                        "current_item": detail["current"],
-                        "total_items": detail["total"],
-                        "item_description": message
-                    }
-                    
-                    # Build concise message
-                    if detail["total"] > 0:
-                        detailed_message = (
-                            f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: "
-                            f"{detail['current']}/{detail['total']} - {message}"
-                        )
-                    else:
-                        detailed_message = f"[{stage_index}/{total_stages}] {stage_names.get(stage, stage)}: {message}"
-                    
-                    task_manager.update_task(
-                        task_id,
-                        progress=current_progress,
-                        message=detailed_message,
-                        progress_detail=progress_detail_data
-                    )
-                
-                result_state = manager.prepare_simulation(
-                    simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement,
-                    document_text=document_text,
-                    defined_entity_types=entity_types_list,
-                    use_llm_for_profiles=use_llm_for_profiles,
-                    progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count,
-                    storage=storage,
-                )
-                
-                # Task complete
-                task_manager.complete_task(
-                    task_id,
-                    result=result_state.to_simple_dict()
-                )
-                
-            except Exception as e:
-                logger.error(f"Failed to prepare simulation: {str(e)}")
-                task_manager.fail_task(task_id, str(e))
-                
-                # Update simulation status to failed
-                state = manager.get_simulation(simulation_id)
-                if state:
-                    state.status = SimulationStatus.FAILED
-                    state.error = str(e)
-                    manager._save_simulation_state(state)
-        
-        # Start background thread
-        thread = threading.Thread(target=run_prepare, daemon=True)
-        thread.start()
+        runner = current_app.extensions.get("background_task_runner")
+        if not runner:
+            raise RuntimeError("Background task runner is unavailable")
+        runner.start(task_id)
         
         return jsonify({
             "success": True,
@@ -1753,6 +1650,58 @@ def get_run_status(simulation_id: str):
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/running', methods=['GET'])
+def list_running_simulations():
+    """List simulation subprocesses that are currently alive."""
+    try:
+        simulations = []
+        for simulation_id in SimulationRunner.get_running_simulations():
+            run_state = SimulationRunner.get_run_state(simulation_id)
+            if not run_state:
+                continue
+            data = run_state.to_dict()
+            data["task_type"] = "simulation_run"
+            data["message"] = (
+                f"Round {run_state.current_round} of {run_state.total_rounds}"
+                if run_state.total_rounds
+                else "Simulation running"
+            )
+            simulations.append(data)
+
+        return jsonify({"success": True, "data": simulations, "count": len(simulations)})
+    except Exception as e:
+        logger.error(f"Failed to list running simulations: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@simulation_bp.route('/run-history', methods=['GET'])
+def list_simulation_run_history():
+    """List saved terminal simulation runs, including runs interrupted by a restart."""
+    try:
+        terminal_statuses = {
+            RunnerStatus.COMPLETED,
+            RunnerStatus.FAILED,
+            RunnerStatus.STOPPED,
+            RunnerStatus.INTERRUPTED,
+        }
+        simulations = []
+        if os.path.isdir(SimulationRunner.RUN_STATE_DIR):
+            for simulation_id in os.listdir(SimulationRunner.RUN_STATE_DIR):
+                run_state = SimulationRunner.get_run_state(simulation_id)
+                if not run_state or run_state.runner_status not in terminal_statuses:
+                    continue
+                data = run_state.to_dict()
+                data["task_type"] = "simulation_run"
+                data["message"] = run_state.error or f"Simulation {run_state.runner_status.value}"
+                simulations.append(data)
+
+        simulations.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return jsonify({"success": True, "data": simulations, "count": len(simulations)})
+    except Exception as e:
+        logger.error(f"Failed to list simulation run history: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @simulation_bp.route('/<simulation_id>/run-status/detail', methods=['GET'])

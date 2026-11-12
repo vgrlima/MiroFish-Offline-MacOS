@@ -137,35 +137,43 @@ const toggleMaximize = (target) => {
 }
 
 // --- Data Logic ---
+const loadSimulationContext = async (targetSimulationId) => {
+  const simRes = await getSimulation(targetSimulationId)
+  if (!simRes.success || !simRes.data) return
+
+  const simData = simRes.data
+  if (!simData.project_id) return
+
+  const projRes = await getProject(simData.project_id)
+  if (!projRes.success || !projRes.data) return
+
+  projectData.value = projRes.data
+  addLog(`Project loaded: ${projRes.data.project_id}`)
+  if (projRes.data.graph_id) {
+    await loadGraph(projRes.data.graph_id)
+  }
+}
+
 const loadReportData = async () => {
   try {
     addLog(`Loading report data: ${currentReportId.value}`)
-    
+
+    const querySimulationId = typeof route.query.simulationId === 'string'
+        ? route.query.simulationId
+        : null
+    if (querySimulationId) {
+        simulationId.value = querySimulationId
+        await loadSimulationContext(querySimulationId)
+    }
+
     // Get report info to retrieve simulation_id
     const reportRes = await getReport(currentReportId.value)
     if (reportRes.success && reportRes.data) {
       const reportData = reportRes.data
       simulationId.value = reportData.simulation_id
-      
-      if (simulationId.value) {
-        // Get simulation info
-        const simRes = await getSimulation(simulationId.value)
-        if (simRes.success && simRes.data) {
-          const simData = simRes.data
-          
-          // Get project info
-          if (simData.project_id) {
-            const projRes = await getProject(simData.project_id)
-            if (projRes.success && projRes.data) {
-              projectData.value = projRes.data
-              addLog(`Project loaded: ${projRes.data.project_id}`)
-              
-              // Get graph data
-              if (projRes.data.graph_id) {
-                await loadGraph(projRes.data.graph_id)
-              }
-            }
-          }
+
+        if (simulationId.value && simulationId.value !== querySimulationId) {
+          await loadSimulationContext(simulationId.value)
         }
       }
     } else {
@@ -208,7 +216,6 @@ watch(() => route.params.reportId, (newId) => {
 
 onMounted(() => {
   addLog('ReportView initialized')
-  loadReportData()
 })
 </script>
 

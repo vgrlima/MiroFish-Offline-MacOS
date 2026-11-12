@@ -11,6 +11,9 @@ Optimization improvements:
 import json
 import random
 import time
+import os
+import tempfile
+import io
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1006,6 +1009,24 @@ Important:
             self._save_twitter_csv(profiles, file_path)
         else:
             self._save_reddit_json(profiles, file_path)
+
+    @staticmethod
+    def _atomic_write(file_path: str, content: str):
+        directory = os.path.dirname(file_path)
+        os.makedirs(directory, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(dir=directory, prefix=".profiles-")
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as output_file:
+                output_file.write(content)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temporary_path, file_path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
     
     def _save_twitter_csv(self, profiles: List[OasisAgentProfile], file_path: str):
         """
@@ -1028,33 +1049,35 @@ Important:
         if not file_path.endswith('.csv'):
             file_path = file_path.replace('.json', '.csv')
 
-        with open(file_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
 
-            # Write OASIS required header
-            headers = ['user_id', 'name', 'username', 'user_char', 'description']
-            writer.writerow(headers)
+        # Write OASIS required header
+        headers = ['user_id', 'name', 'username', 'user_char', 'description']
+        writer.writerow(headers)
 
-            # Write data rows
-            for idx, profile in enumerate(profiles):
-                # user_char: Complete persona (bio + persona) for LLM system prompt
-                user_char = profile.bio
-                if profile.persona and profile.persona != profile.bio:
-                    user_char = f"{profile.bio} {profile.persona}"
-                # Handle newlines (replace with space in CSV)
-                user_char = user_char.replace('\n', ' ').replace('\r', ' ')
+        # Write data rows
+        for idx, profile in enumerate(profiles):
+            # user_char: Complete persona (bio + persona) for LLM system prompt
+            user_char = profile.bio
+            if profile.persona and profile.persona != profile.bio:
+                user_char = f"{profile.bio} {profile.persona}"
+            # Handle newlines (replace with space in CSV)
+            user_char = user_char.replace('\n', ' ').replace('\r', ' ')
 
-                # description: Short bio for external display
-                description = profile.bio.replace('\n', ' ').replace('\r', ' ')
+            # description: Short bio for external display
+            description = profile.bio.replace('\n', ' ').replace('\r', ' ')
 
-                row = [
-                    idx,                    # user_id: Sequential ID starting from 0
-                    profile.name,           # name: Real name
-                    profile.user_name,      # username: Username
-                    user_char,              # user_char: Complete persona (internal LLM use)
-                    description             # description: Short bio (external display)
-                ]
-                writer.writerow(row)
+            row = [
+                idx,                    # user_id: Sequential ID starting from 0
+                profile.name,           # name: Real name
+                profile.user_name,      # username: Username
+                user_char,              # user_char: Complete persona (internal LLM use)
+                description             # description: Short bio (external display)
+            ]
+            writer.writerow(row)
+
+        self._atomic_write(file_path, output.getvalue())
 
         logger.info(f"Saved {len(profiles)} Twitter profiles to {file_path} (OASIS CSV format)")
     
@@ -1122,8 +1145,7 @@ Important:
 
             data.append(item)
 
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        self._atomic_write(file_path, json.dumps(data, ensure_ascii=False, indent=2))
 
         logger.info(f"Saved {len(profiles)} Reddit profiles to {file_path} (JSON format, includes user_id field)")
     

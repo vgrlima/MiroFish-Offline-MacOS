@@ -13,6 +13,7 @@ import os
 import json
 import time
 import re
+import tempfile
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1585,6 +1586,14 @@ class ReportAgent:
         try:
             # Initialize: Create report folder and save initial state
             ReportManager._ensure_report_folder(report_id)
+            existing_outline = ReportManager.get_outline(report_id)
+            saved_sections = {
+                item["section_index"]: item["content"]
+                for item in ReportManager.get_generated_sections(report_id)
+            }
+            if existing_outline:
+                report.outline = existing_outline
+                report.status = ReportStatus.GENERATING
             
             # Initialize logslogger（structured logs agent_log.jsonl）
             self.report_logger = ReportLogger(report_id)
@@ -1597,43 +1606,42 @@ class ReportAgent:
             # Initialize console logslogger（console_log.txt）
             self.console_logger = ReportConsoleLogger(report_id)
             
-            ReportManager.update_progress(
-                report_id, "pending", 0, "Initializereport...",
-                completed_sections=[]
-            )
+            if not existing_outline:
+                ReportManager.update_progress(
+                    report_id, "pending", 0, "Initializereport...",
+                    completed_sections=[]
+                )
             ReportManager.save_report(report)
             
             # phase1: planoutline
-            report.status = ReportStatus.PLANNING
-            ReportManager.update_progress(
-                report_id, "planning", 5, "Start planning report outline...",
-                completed_sections=[]
-            )
-            
-            # Log outline planning start
-            self.report_logger.log_planning_start()
-            
-            if progress_callback:
-                progress_callback("planning", 0, "Start planning report outline...")
-            
-            outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
-            )
-            report.outline = outline
-            
-            # recordplancompletion log
-            self.report_logger.log_planning_complete(outline.to_dict())
-            
-            # saveoutlinetofile
-            ReportManager.save_outline(report_id, outline)
-            ReportManager.update_progress(
-                report_id, "planning", 15, f"Outline planning completed, total{len(outline.sections)}sections",
-                completed_sections=[]
-            )
-            ReportManager.save_report(report)
-            
-            logger.info(f"outlinesavedtofile: {report_id}/outline.json")
+            if existing_outline:
+                outline = existing_outline
+                logger.info(f"Resuming report from saved outline: {report_id}")
+            else:
+                report.status = ReportStatus.PLANNING
+                ReportManager.update_progress(
+                    report_id, "planning", 5, "Start planning report outline...",
+                    completed_sections=[]
+                )
+
+                self.report_logger.log_planning_start()
+
+                if progress_callback:
+                    progress_callback("planning", 0, "Start planning report outline...")
+
+                outline = self.plan_outline(
+                    progress_callback=lambda stage, prog, msg:
+                        progress_callback(stage, prog // 5, msg) if progress_callback else None
+                )
+                report.outline = outline
+                self.report_logger.log_planning_complete(outline.to_dict())
+                ReportManager.save_outline(report_id, outline)
+                ReportManager.update_progress(
+                    report_id, "planning", 15, f"Outline planning completed, total{len(outline.sections)}sections",
+                    completed_sections=[]
+                )
+                ReportManager.save_report(report)
+                logger.info(f"outlinesavedtofile: {report_id}/outline.json")
             
             # Phase 2: Sequentially generate sectionsgeneration (per sectionsave）
             report.status = ReportStatus.GENERATING
@@ -1644,6 +1652,31 @@ class ReportAgent:
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
                 base_progress = 20 + int((i / total_sections) * 70)
+
+                saved_content = saved_sections.get(section_num, "")
+                expected_heading = f"## {section.title}"
+                if saved_content.startswith(expected_heading):
+                    section_content = saved_content[len(expected_heading):].strip()
+                    section.content = section_content
+                    generated_sections.append(f"## {section.title}\n\n{section_content}")
+                    if section.title not in completed_section_titles:
+                        completed_section_titles.append(section.title)
+                    resumed_progress = base_progress + int(70 / total_sections)
+                    ReportManager.update_progress(
+                        report_id,
+                        "generating",
+                        resumed_progress,
+                        f"Restored completed section: {section.title}",
+                        current_section=None,
+                        completed_sections=completed_section_titles,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            "generating",
+                            resumed_progress,
+                            f"Restored completed section: {section.title}",
+                        )
+                    continue
                 
                 # Update progress
                 ReportManager.update_progress(
@@ -2093,10 +2126,47 @@ class ReportManager:
         """
         cls._ensure_report_folder(report_id)
         
-        with open(cls._get_outline_path(report_id), 'w', encoding='utf-8') as f:
-            json.dump(outline.to_dict(), f, ensure_ascii=False, indent=2)
+        cls._atomic_write(
+            cls._get_outline_path(report_id),
+            json.dumps(outline.to_dict(), ensure_ascii=False, indent=2),
+        )
         
         logger.info(f"outlinesaved: {report_id}")
+
+    @classmethod
+    def get_outline(cls, report_id: str) -> Optional[ReportOutline]:
+        path = cls._get_outline_path(report_id)
+        if not os.path.exists(path):
+            return None
+
+        with open(path, 'r', encoding='utf-8') as outline_file:
+            data = json.load(outline_file)
+        return ReportOutline(
+            title=data["title"],
+            summary=data["summary"],
+            sections=[
+                ReportSection(title=section["title"], content=section.get("content", ""))
+                for section in data.get("sections", [])
+            ],
+        )
+
+    @staticmethod
+    def _atomic_write(path: str, content: str):
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(dir=directory, prefix=".checkpoint-")
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as output_file:
+                output_file.write(content)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temporary_path, path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
     
     @classmethod
     def save_section(
@@ -2129,8 +2199,7 @@ class ReportManager:
         # savefile
         file_suffix = f"section_{section_index:02d}.md"
         file_path = os.path.join(cls._get_report_folder(report_id), file_suffix)
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(md_content)
+        cls._atomic_write(file_path, md_content)
 
         logger.info(f"Sectionsaved: {report_id}/{file_suffix}")
         return file_path
@@ -2436,8 +2505,10 @@ class ReportManager:
         cls._ensure_report_folder(report.report_id)
         
         # savemetainformationJSON
-        with open(cls._get_report_path(report.report_id), 'w', encoding='utf-8') as f:
-            json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+        cls._atomic_write(
+            cls._get_report_path(report.report_id),
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+        )
         
         # saveoutline
         if report.outline:
@@ -2445,8 +2516,7 @@ class ReportManager:
         
         # saveCompleteMarkdownReport
         if report.markdown_content:
-            with open(cls._get_report_markdown_path(report.report_id), 'w', encoding='utf-8') as f:
-                f.write(report.markdown_content)
+            cls._atomic_write(cls._get_report_markdown_path(report.report_id), report.markdown_content)
         
         logger.info(f"reportsaved: {report.report_id}")
     

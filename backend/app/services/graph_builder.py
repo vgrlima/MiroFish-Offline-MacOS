@@ -80,9 +80,11 @@ class GraphBuilderService:
         # Execute build in background thread
         thread = threading.Thread(
             target=self._build_graph_worker,
-            args=(task_id, text, ontology, graph_name, chunk_size, chunk_overlap, batch_size)
+            args=(task_id, text, ontology, graph_name, chunk_size, chunk_overlap, batch_size),
+            name=f"graph-build-{task_id[:8]}"
         )
         thread.daemon = True
+        self.task_manager.attach_thread(task_id, thread)
         thread.start()
 
         return task_id
@@ -99,6 +101,7 @@ class GraphBuilderService:
     ):
         """Graph build worker thread"""
         try:
+            self.task_manager.raise_if_cancelled(task_id)
             self.task_manager.update_task(
                 task_id,
                 status=TaskStatus.PROCESSING,
@@ -107,6 +110,7 @@ class GraphBuilderService:
             )
 
             # 1. Create graph
+            self.task_manager.raise_if_cancelled(task_id)
             graph_id = self.create_graph(graph_name)
             self.task_manager.update_task(
                 task_id,
@@ -115,6 +119,7 @@ class GraphBuilderService:
             )
 
             # 2. Set ontology
+            self.task_manager.raise_if_cancelled(task_id)
             self.set_ontology(graph_id, ontology)
             self.task_manager.update_task(
                 task_id,
@@ -123,6 +128,7 @@ class GraphBuilderService:
             )
 
             # 3. Text chunking
+            self.task_manager.raise_if_cancelled(task_id)
             chunks = TextProcessor.split_text(text, chunk_size, chunk_overlap)
             total_chunks = len(chunks)
             self.task_manager.update_task(
@@ -132,16 +138,14 @@ class GraphBuilderService:
             )
 
             # 4. Send data in batches (NER + embedding + Neo4j insert — synchronous)
+            self.task_manager.raise_if_cancelled(task_id)
             episode_uuids = self.add_text_batches(
                 graph_id, chunks, batch_size,
-                lambda msg, prog: self.task_manager.update_task(
-                    task_id,
-                    progress=20 + int(prog * 0.6),  # 20-80%
-                    message=msg
-                )
+                lambda msg, prog: self._update_graph_build_progress(task_id, msg, prog)
             )
 
             # 5. Wait for processing (no-op for Neo4j — already synchronous)
+            self.task_manager.raise_if_cancelled(task_id)
             self.storage.wait_for_processing(episode_uuids)
 
             self.task_manager.update_task(
@@ -151,6 +155,7 @@ class GraphBuilderService:
             )
 
             # 6. Get graph information
+            self.task_manager.raise_if_cancelled(task_id)
             graph_info = self._get_graph_info(graph_id)
 
             # Completed
@@ -162,8 +167,19 @@ class GraphBuilderService:
 
         except Exception as e:
             import traceback
+            if self.task_manager.is_cancel_requested(task_id):
+                self.task_manager.mark_cancelled(task_id)
+                return
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             self.task_manager.fail_task(task_id, error_msg)
+
+    def _update_graph_build_progress(self, task_id: str, message: str, progress: float):
+        self.task_manager.raise_if_cancelled(task_id)
+        self.task_manager.update_task(
+            task_id,
+            progress=20 + int(progress * 0.6),
+            message=message
+        )
 
     def create_graph(self, name: str) -> str:
         """Create graph"""

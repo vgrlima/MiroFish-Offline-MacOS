@@ -1,9 +1,10 @@
 <template>
   <router-view />
+  <BackgroundProcessManager />
 </template>
 
 <script setup>
-// Use Vue Router to manage pages
+import BackgroundProcessManager from './components/BackgroundProcessManager.vue'
 </script>
 
 <style>

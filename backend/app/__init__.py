@@ -54,7 +54,7 @@ def create_app(config_class=Config):
         # Store None so endpoints can return 503 gracefully
         app.extensions['neo4j_storage'] = None
 
-    # Register simulation process cleanup function (ensure all simulation processes terminate on server shutdown)
+    # Detach simulation process handles on shutdown so a restarted backend can reattach.
     from .services.simulation_runner import SimulationRunner
     SimulationRunner.register_cleanup()
     if should_log_startup:
@@ -79,6 +79,31 @@ def create_app(config_class=Config):
     app.register_blueprint(graph_bp, url_prefix='/api/graph')
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
+
+    from .services.background_task_runner import BackgroundTaskRunner
+    from .services.background_task_handlers import register_background_task_handlers
+
+    background_task_runner = BackgroundTaskRunner(app)
+    register_background_task_handlers(background_task_runner)
+    app.extensions["background_task_runner"] = background_task_runner
+
+    if should_log_startup:
+        storage = app.extensions.get("neo4j_storage")
+        resumed_tasks = (
+            background_task_runner.resume_interrupted()
+            if storage
+            else 0
+        )
+        recovered_simulations = SimulationRunner.get_running_simulations(
+            storage=storage,
+            startup_recovery=True,
+        )
+        if resumed_tasks or recovered_simulations:
+            logger.info(
+                "Recovered background work: tasks=%s, simulations=%s",
+                resumed_tasks,
+                len(recovered_simulations),
+            )
 
     # Health check
     @app.route('/health')
